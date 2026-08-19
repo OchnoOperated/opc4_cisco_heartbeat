@@ -4,14 +4,63 @@
     <Order>1</Order>
     <PanelId>opc4_heartbeat_panel</PanelId>
     <Origin>local</Origin>
-    <Location>Hidden</Location>
+    <Location>HomeScreen</Location>
     <Icon>Info</Icon>
     <Name>OPC4 Heartbeat</Name>
     <ActivityType>Custom</ActivityType>
     <Page>
       <Name>OPC4 Heartbeat</Name>
       <Row>
-        <Name>Status</Name>
+        <Name>Last Heartbeat</Name>
+        <Widget>
+          <WidgetId>opc_heartbeat</WidgetId>
+          <Name>opc_heartbeat</Name>
+          <Type>Text</Type>
+          <Options>size=4;fontSize=normal;align=left</Options>
+        </Widget>
+      </Row>
+      <Row>
+        <Name>UC Mode</Name>
+        <Widget>
+          <WidgetId>opc_uc</WidgetId>
+          <Name>opc_uc</Name>
+          <Type>Text</Type>
+          <Options>size=4;fontSize=normal;align=left</Options>
+        </Widget>
+      </Row>
+      <Row>
+        <Name>Connected Ports</Name>
+        <Widget>
+          <WidgetId>opc_connected</WidgetId>
+          <Name>opc_connected</Name>
+          <Type>Text</Type>
+          <Options>size=4;fontSize=normal;align=left</Options>
+        </Widget>
+      </Row>
+      <Row>
+        <Name>Active Port</Name>
+        <Widget>
+          <WidgetId>opc_active</WidgetId>
+          <Name>opc_active</Name>
+          <Type>Text</Type>
+          <Options>size=4;fontSize=normal;align=left</Options>
+        </Widget>
+      </Row>
+      <Options/>
+    </Page>
+  </Panel>
+  <Panel>
+    <Order>2</Order>
+    <PanelId>opc4_heartbeat_source_panel</PanelId>
+    <Origin>local</Origin>
+    <Location>Hidden</Location>
+    <Icon>Info</Icon>
+    <Name>OPC4 Heartbeat Source</Name>
+    <ActivityType>Custom</ActivityType>
+    <Page>
+      <Name>OPC4 Heartbeat Source</Name>
+      <Row>
+        <Name>Status Source</Name>
         <Widget>
           <WidgetId>opc_status</WidgetId>
           <Name>opc_status</Name>
