@@ -14,6 +14,20 @@ param(
 
     [string]$WidgetId = 'opc_status',
 
+    # Widget  = current firmware: UserInterface Extensions Widget SetValue (needs hidden widget, RoomControl role OK)
+    # Message = recommended: Message Send (no widget at all, event driven, needs Integrator role)
+    [ValidateSet('Widget', 'Message')]
+    [string]$Transport = 'Widget',
+
+    [string]$MessagePrefix = 'opc4:',
+
+    # Optional: also register as a RoomOS peripheral and send native Peripherals HeartBeat
+    [switch]$RegisterPeripheral,
+
+    [string]$PeripheralId = 'OPC4-EMULATOR-0001',
+
+    [string]$PeripheralName = 'Ochno OPC4',
+
     [int]$IntervalSeconds = 30,
 
     [int]$InitialConnected = 0,
@@ -86,6 +100,61 @@ function New-BasicAuthHeader {
     return "Basic $token"
 }
 
+function ConvertTo-XmlText {
+    param([string]$Text)
+    return [System.Security.SecurityElement]::Escape($Text)
+}
+
+function New-MessageSendXml {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Value
+    )
+
+    $text = ConvertTo-XmlText ("{0}{1}" -f $MessagePrefix, $Value)
+    return @"
+<Command>
+  <Message>
+    <Send>
+      <Text>$text</Text>
+    </Send>
+  </Message>
+</Command>
+"@
+}
+
+function New-PeripheralConnectXml {
+    $id = ConvertTo-XmlText $PeripheralId
+    $name = ConvertTo-XmlText $PeripheralName
+    return @"
+<Command>
+  <Peripherals>
+    <Connect>
+      <ID>$id</ID>
+      <Name>$name</Name>
+      <Type>Other</Type>
+      <SoftwareInfo>opc4-emulator</SoftwareInfo>
+    </Connect>
+  </Peripherals>
+</Command>
+"@
+}
+
+function New-PeripheralHeartBeatXml {
+    $id = ConvertTo-XmlText $PeripheralId
+    $timeout = [Math]::Max(1, $IntervalSeconds * 3)
+    return @"
+<Command>
+  <Peripherals>
+    <HeartBeat>
+      <ID>$id</ID>
+      <Timeout>$timeout</Timeout>
+    </HeartBeat>
+  </Peripherals>
+</Command>
+"@
+}
+
 function New-WidgetSetValueXml {
     param(
         [Parameter(Mandatory = $true)]
@@ -101,8 +170,8 @@ function New-WidgetSetValueXml {
     <Extensions>
       <Widget>
         <SetValue>
-          <WidgetId>$TargetWidgetId</WidgetId>
-          <Value>$Value</Value>
+          <WidgetId>$(ConvertTo-XmlText $TargetWidgetId)</WidgetId>
+          <Value>$(ConvertTo-XmlText $Value)</Value>
         </SetValue>
       </Widget>
     </Extensions>
@@ -132,7 +201,32 @@ function Invoke-CiscoPost {
         [string]$Description
     )
 
-    $body = New-WidgetSetValueXml -TargetWidgetId $TargetWidgetId -Value $Value
+    $body = if ($Transport -eq 'Message') {
+        New-MessageSendXml -Value $Value
+    } else {
+        New-WidgetSetValueXml -TargetWidgetId $TargetWidgetId -Value $Value
+    }
+
+    Invoke-CiscoXml -Uri $Uri -Headers $Headers -RequestContentType $RequestContentType -Body $body -Description $Description
+}
+
+function Invoke-CiscoXml {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Headers,
+
+        [Parameter(Mandatory = $true)]
+        [string]$RequestContentType,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Body,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
 
     try {
         $response = Invoke-WebRequest `
@@ -140,7 +234,7 @@ function Invoke-CiscoPost {
             -Method Post `
             -Headers $Headers `
             -ContentType $RequestContentType `
-            -Body $body `
+            -Body $Body `
             -UseBasicParsing
 
         Write-Host ''
@@ -171,7 +265,21 @@ function New-FullStatusValue {
     return 'alive={0},connected={1},active={2},mode={3}' -f $sequence, $script:CurrentConnected, $script:CurrentActive, $script:CurrentMode
 }
 
+function Send-PeripheralConnect {
+    Invoke-CiscoXml -Uri $script:Uri -Headers $script:Headers -RequestContentType $ContentType `
+        -Body (New-PeripheralConnectXml) -Description "Peripheral registered. ID='$PeripheralId'"
+}
+
+function Send-PeripheralHeartBeat {
+    Invoke-CiscoXml -Uri $script:Uri -Headers $script:Headers -RequestContentType $ContentType `
+        -Body (New-PeripheralHeartBeatXml) -Description "Peripheral heartbeat sent. ID='$PeripheralId'"
+}
+
 function Send-AliveHeartbeat {
+    if ($RegisterPeripheral) {
+        Send-PeripheralHeartBeat
+    }
+
     $aliveValue = New-AliveValue
     Invoke-CiscoPost `
         -Uri $script:Uri `
@@ -317,10 +425,22 @@ $script:Sequence = $InitialSequence
 
 Write-Host "POST target: $script:Uri"
 Write-Host "ContentType: $ContentType"
-Write-Host "WidgetId: $WidgetId"
+Write-Host "Transport: $Transport"
+if ($Transport -eq 'Message') {
+    Write-Host "MessagePrefix: $MessagePrefix"
+} else {
+    Write-Host "WidgetId: $WidgetId"
+}
+if ($RegisterPeripheral) {
+    Write-Host "Peripheral: $PeripheralId ($PeripheralName)"
+}
 Write-Host "IntervalSeconds: $IntervalSeconds"
 Show-CurrentStatus
 Show-Help
+
+if ($RegisterPeripheral) {
+    Send-PeripheralConnect
+}
 
 $nextHeartbeatAt = Get-Date
 $inputBuffer = ''

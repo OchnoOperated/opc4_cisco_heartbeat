@@ -1,0 +1,300 @@
+import xapi from 'xapi';
+
+//
+// Proof-of-concept monitor for an external OPC4 device.
+// The external client updates a UI Extensions text widget through the Cisco xAPI:
+//   xCommand UserInterface Extensions Widget SetValue
+//
+// Expected payloads:
+//   alive=17
+//   alive=18,connected=5,active=3,mode=uc
+//
+
+const company = '_COMPANY_NAME';
+const site = '_COMPANY_SITE';
+const teamsMsgUrl = '';
+
+const heartbeatWidgetId = 'opc_status';
+const heartbeatIntervalSeconds = 30;
+const missedHeartbeatThreshold = 2;
+const pollIntervalSeconds = 5;
+const timeoutGraceSeconds = 5;
+
+const DEBUG = 1;
+
+let location = 'Unknown_room_name';
+let device = 'Unknown_device_type';
+let lastWidgetValue = '';
+let lastHeartbeatAtMs = 0;
+let heartbeatMissing = false;
+let lastParsedStatus = {};
+let lastAliveSequence = null;
+let currentStatus = {
+  connected: '0',
+  active: '0',
+  mode: 'unknown',
+};
+
+function log(message) {
+  if (DEBUG) {
+    console.log(message);
+  }
+}
+
+async function getDeviceInformations() {
+  try {
+    location = await xapi.Status.SystemUnit.BroadcastName.get();
+  } catch (error) {
+    console.error('Unable to get device information: Broadcast Name', error);
+  }
+
+  try {
+    device = await xapi.Status.SystemUnit.ProductId.get();
+  } catch (error) {
+    console.error('Unable to get device information: Product ID', error);
+  }
+}
+
+async function sendTeamsMessage(message) {
+  if (!teamsMsgUrl) {
+    log(`Monitoring URL not configured. Message would have been: ${JSON.stringify(message)}`);
+    return;
+  }
+
+  await xapi.Command.HttpClient.Post(
+    { Header: 'Content-Type: application/json', Url: teamsMsgUrl },
+    JSON.stringify(message)
+  );
+}
+
+async function sendAlert(message) {
+  const payload = { location, device, message, company, site };
+  log(`Sending alert: ${message}`);
+  await sendTeamsMessage(payload);
+}
+
+async function initHttpClient() {
+  try {
+    await xapi.Config.HttpClient.Mode.set('On');
+  } catch (error) {
+    console.error('Unable to enable HttpClient mode', error);
+  }
+}
+
+function toArray(value) {
+  if (Array.isArray(value)) {
+    return value;
+  }
+
+  if (!value) {
+    return [];
+  }
+
+  return [value];
+}
+
+function parseStatusPayload(widgetValue) {
+  const parsed = {};
+
+  String(widgetValue)
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .forEach((part) => {
+      const separatorIndex = part.indexOf('=');
+
+      if (separatorIndex === -1) {
+        parsed[part] = true;
+        return;
+      }
+
+      const key = part.slice(0, separatorIndex).trim();
+      const value = part.slice(separatorIndex + 1).trim();
+
+      if (key) {
+        parsed[key] = value;
+      }
+    });
+
+  return parsed;
+}
+
+function mergeStatus(parsedStatus) {
+  if ('connected' in parsedStatus) {
+    currentStatus.connected = parsedStatus.connected;
+  }
+
+  if ('active' in parsedStatus) {
+    currentStatus.active = parsedStatus.active;
+  }
+
+  if ('mode' in parsedStatus) {
+    currentStatus.mode = parsedStatus.mode;
+  }
+}
+
+function buildStatusSummary(status) {
+  return `connected=${status.connected}, active=${status.active}, mode=${status.mode}`;
+}
+
+function isStatusChange(parsedStatus) {
+  return 'connected' in parsedStatus || 'active' in parsedStatus || 'mode' in parsedStatus;
+}
+
+function parseAliveSequence(parsedStatus) {
+  if (!('alive' in parsedStatus)) {
+    return null;
+  }
+
+  const sequence = Number.parseInt(parsedStatus.alive, 10);
+  if (Number.isNaN(sequence) || sequence < 0 || sequence > 255) {
+    return null;
+  }
+
+  return sequence;
+}
+
+function describeSequenceProgress(sequence) {
+  if (sequence === null) {
+    return 'invalid or missing';
+  }
+
+  if (lastAliveSequence === null) {
+    return 'initial';
+  }
+
+  const expectedNext = (lastAliveSequence + 1) % 256;
+  if (sequence === expectedNext) {
+    if (lastAliveSequence === 255 && sequence === 0) {
+      return 'wrap';
+    }
+
+    return 'ok';
+  }
+
+  if (sequence === lastAliveSequence) {
+    return 'duplicate';
+  }
+
+  return `unexpected (expected ${expectedNext})`;
+}
+
+function logHeartbeat(parsedStatus) {
+  const aliveSequence = parseAliveSequence(parsedStatus);
+  const sequenceState = describeSequenceProgress(aliveSequence);
+  const aliveValue = aliveSequence === null ? 'missing' : aliveSequence;
+  console.log(`Heartbeat received: seq=${aliveValue} (${sequenceState})`);
+  console.log(`Current OPC4 status: ${buildStatusSummary(currentStatus)}`);
+}
+
+function logStatusChange(parsedStatus) {
+  const aliveSequence = parseAliveSequence(parsedStatus);
+  const sequenceState = describeSequenceProgress(aliveSequence);
+  const aliveValue = aliveSequence === null ? 'missing' : aliveSequence;
+  console.log(`Status Change received: seq=${aliveValue} (${sequenceState})`);
+  console.log(`OPC4 status: ${buildStatusSummary(currentStatus)}`);
+
+  if ('connected' in parsedStatus) {
+    console.log(`Connected bitmap (decimal): ${parsedStatus.connected}`);
+  }
+
+  if ('active' in parsedStatus) {
+    console.log(`Active port: ${parsedStatus.active}`);
+  }
+
+  if ('mode' in parsedStatus) {
+    console.log(`Mode: ${parsedStatus.mode}`);
+  }
+}
+
+async function getHeartbeatWidgetValue() {
+  const widgets = toArray(await xapi.Status.UserInterface.Extensions.Widget.get());
+
+  if (!widgets.length) {
+    console.log('No UI extension widgets are currently exposed by the device. Make sure the panel XML is loaded and the widget exists.');
+    return '';
+  }
+
+  const widgetIds = widgets.map((widget) => widget.WidgetId).join(', ');
+  console.log(`Discovered widgets: ${widgetIds}`);
+
+  const match = widgets.find((widget) => widget.WidgetId === heartbeatWidgetId);
+  if (!match) {
+    console.log(`Widget '${heartbeatWidgetId}' was not found. Available widget IDs: ${widgetIds}`);
+    return '';
+  }
+
+  return match ? String(match.Value || '') : '';
+}
+
+async function onWidgetValueReceived(widgetValue) {
+  const parsedStatus = parseStatusPayload(widgetValue);
+  const statusChanged = isStatusChange(parsedStatus);
+  const aliveSequence = parseAliveSequence(parsedStatus);
+
+  lastHeartbeatAtMs = Date.now();
+  lastWidgetValue = widgetValue;
+  lastParsedStatus = parsedStatus;
+
+  mergeStatus(parsedStatus);
+
+  if (statusChanged) {
+    logStatusChange(parsedStatus);
+  } else {
+    logHeartbeat(parsedStatus);
+  }
+
+  if (aliveSequence !== null) {
+    lastAliveSequence = aliveSequence;
+  }
+
+  if (heartbeatMissing) {
+    heartbeatMissing = false;
+    await sendAlert(`OPC4 heartbeat recovered on widget ${heartbeatWidgetId}. Current status: ${buildStatusSummary(currentStatus)}.`);
+  }
+}
+
+function getHeartbeatTimeoutMs() {
+  return ((heartbeatIntervalSeconds * missedHeartbeatThreshold) + timeoutGraceSeconds) * 1000;
+}
+
+async function checkHeartbeat() {
+  try {
+    const currentValue = await getHeartbeatWidgetValue();
+
+    if (!currentValue) {
+      log(`Heartbeat widget ${heartbeatWidgetId} has no value yet.`);
+    } else if (currentValue !== lastWidgetValue) {
+      await onWidgetValueReceived(currentValue);
+    }
+
+    if (!lastHeartbeatAtMs) {
+      return;
+    }
+
+    const ageMs = Date.now() - lastHeartbeatAtMs;
+    if (ageMs <= getHeartbeatTimeoutMs()) {
+      return;
+    }
+
+    if (!heartbeatMissing) {
+      heartbeatMissing = true;
+      const ageSeconds = Math.floor(ageMs / 1000);
+      await sendAlert(
+        `OPC4 heartbeat missing. No new value received on widget ${heartbeatWidgetId} for ${ageSeconds} seconds. Last known status: ${buildStatusSummary(currentStatus)}.`
+      );
+    }
+  } catch (error) {
+    console.error('Error while checking OPC4 heartbeat', error);
+  }
+}
+
+function start() {
+  console.log('Starting OPC4 heartbeat monitor macro');
+  initHttpClient();
+  getDeviceInformations();
+  checkHeartbeat();
+  setInterval(checkHeartbeat, pollIntervalSeconds * 1000);
+}
+
+start();

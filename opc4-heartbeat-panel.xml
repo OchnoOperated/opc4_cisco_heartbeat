@@ -1,3 +1,8 @@
+<!--
+  OPTIONAL. Since monitor v2 the macro installs these panels itself
+  (hidden source panel always, status panel when CONFIG.showStatusPanel = true).
+  Import this file manually only if you prefer to manage the UI yourself.
+-->
 <Extensions>
   <Version>1.11</Version>
   <Panel>
@@ -10,6 +15,15 @@
     <ActivityType>Custom</ActivityType>
     <Page>
       <Name>OPC4 Heartbeat</Name>
+      <Row>
+        <Name>State</Name>
+        <Widget>
+          <WidgetId>opc_state</WidgetId>
+          <Name>opc_state</Name>
+          <Type>Text</Type>
+          <Options>size=4;fontSize=normal;align=left</Options>
+        </Widget>
+      </Row>
       <Row>
         <Name>Last Heartbeat</Name>
         <Widget>
