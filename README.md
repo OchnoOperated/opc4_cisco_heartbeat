@@ -129,7 +129,7 @@ Check the version: web interface → **Home**, or `xStatus SystemUnit Software V
 | Restriction | Impact |
 | --- | --- |
 | **Message Send** requires role **Integrator** or Admin | A RoomControl OPC4 user is enough for the Widget transport, not for Message Send |
-| Macros run as **Admin** by default | Do not lower the macro's role (`Macros Macro Roles`): saving the last known status (`Macros Macro Save`) and webhook alerts (`HttpClient Post`) need Admin |
+| Macros run as **Admin** by default | Do not lower the macro's role (`Macros Macro Roles`): webhook alerts (`HttpClient Post`) and the clean-up of the old helper macro (`Macros Macro Remove`) need Admin |
 | Webhook over plain `http://` | Needs `HttpClient AllowHTTP: True`. A self-signed HTTPS certificate needs `HttpClient AllowInsecureHTTPS: True`. A normal public HTTPS webhook (Teams, Power Automate) needs nothing extra. |
 | HttpClient handles one request at a time | Alerts are sent one by one; an alert that fails is logged, not retried |
 | Plain HTTP between OPC4 and codec | Needs `NetworkServices HTTP Mode: HTTP+HTTPS` (default is HTTPS only) |
@@ -146,13 +146,23 @@ The macro can show the OPC4 status on the Touch Controller / Room Navigator:
 
 | Row | Widget ID | Shows | Width |
 | --- | --- | --- | --- |
-| Active Port | `opc_active` | `1`-`4`, `none`, or `unknown` | 2 |
-| Connected Ports | `opc_connected` | e.g. `1, 4`, `none`, or `unknown` | 2 |
-| Mode | `opc_uc` | `UC` / `BYOD` / `unknown` | 2 |
-| State | `opc_state` | `OK` / `HEARTBEAT MISSING` | 2 |
-| Last Heartbeat | `opc_heartbeat` | `2026-11-24 14:45:52` or `never` | 4 |
+| Active Port | `opc_active` | `1`-`4`, `None` (port 0: no port active) or `N/A` (not reported yet) | 2 |
+| Connected Ports | `opc_connected` | e.g. `1, 4`, `None` (nothing connected) or `N/A` (not reported yet) | 2 |
+| Mode | `opc_uc` | `UC` / `BYOD`, or `N/A` | 2 |
+| State | `opc_state` | `N/A`, `ONLINE` or `OFFLINE` (see below) | 2 |
+| Updated At | `opc_heartbeat` | `2026-11-24 14:45:52` or `Waiting for update` (right-aligned) | 4 |
 
-Values update on every heartbeat and status change.
+Values update on every heartbeat and status change. Until the OPC4 has reported anything (e.g. right after the macro starts), the panel shows `N/A` for Active Port, Connected Ports, Mode and State, and `Waiting for update` for Updated At. `None` is only shown when the OPC4 actually reports port 0 / nothing connected. See [section 8](#8-status-after-a-restart).
+
+### State values
+
+| State | Meaning | What to do |
+| --- | --- | --- |
+| `N/A` | No heartbeat received yet since the macro started | Normal for up to ~30 s after a start. If it stays, check that the OPC4 is powered and configured with this codec's address and user. |
+| `ONLINE` | Heartbeats are arriving periodically; the OPC4 is alive | Nothing |
+| `OFFLINE` | No heartbeat for longer than the timeout (65 s by default: 2 missed heartbeats of 30 s plus 5 s grace). A "heartbeat missing" alert is raised at the same moment. | Check the OPC4 power and network connection, and its codec user / password. |
+
+`OFFLINE` switches back to `ONLINE` with the next heartbeat, and a "heartbeat recovered" alert is raised. If no heartbeat arrives at all after the macro starts, the state goes from `N/A` straight to `OFFLINE` after the timeout. While the state is `OFFLINE`, the other rows show the last values the OPC4 reported before it went silent, and **Updated At** shows when that was.
 
 ### Three ways to use the UI
 
@@ -178,7 +188,7 @@ statusPanelIcon: 'Info',   // e.g. Info, Lightbulb, Helpdesk, Laptop, Tv, Slider
 
 The macro **re-saves its own panel on every start**, so:
 
-- Change the order, names or widths in `STATUS_PANEL_ROWS` in the macro (each entry is `[row name, widget ID, width 1-4]`), not in the UI Extensions editor. Edits made in the editor to "OPC4 Status" are overwritten at the next restart.
+- Change the order, names or widths in `STATUS_PANEL_ROWS` in the macro (each entry is `[row name, widget ID, width 1-4, alignment left|center|right]`), not in the UI Extensions editor. Edits made in the editor to "OPC4 Status" are overwritten at the next restart.
 - If you want to design the panel freely in the editor, use **Your own panel** above instead (`showStatusPanel: false`, your own panel with the same widget IDs). `opc4-heartbeat-panel.xml` is a ready-made example to import.
 
 ### Turning the panel off again
@@ -193,7 +203,7 @@ A macro cannot receive HTTP requests, so the OPC4 POSTs an xAPI command to `/put
 
 | Transport | OPC4 sends | Minimum user role | Notes |
 | --- | --- | --- | --- |
-| **Widget** (current firmware, default on) | `UserInterface Extensions Widget SetValue`, widget `opc_status` | RoomControl | Works today. The macro reads the widget every second (`widgetPollSeconds`). The widget holds only the latest value, so two updates within one second overwrite each other; heartbeat detection and the final status are not affected. |
+| **Widget** (current firmware, default on) | `UserInterface Extensions Widget SetValue`, widget `opc_status` | RoomControl | Works today. The macro reads the widget every second (`widgetPollSeconds`). The widget holds only the latest value, so two updates within one second overwrite each other; heartbeat detection and the final status are not affected. After reading a value, and once the widget has been quiet for 3 s, the macro marks it as read (`read:alive=5,...`), so a heartbeat that repeats exactly the same text is still detected. See [Reliability](#reliability). |
 | **Message** (recommended, default on) | `Message Send`, text `opc4:<payload>` | Integrator | Instant, nothing is lost, no widget needed. Needs an OPC4 firmware change. |
 | **Peripheral** (optional, default off) | `Peripherals Connect` once, then `Peripherals HeartBeat` | RoomControl | RoomOS tracks liveness itself and lists the OPC4 under Peripherals / Control Hub. Carries no port/mode data, so combine with Widget or Message. Set `transports.peripheral: true` and `peripheralId`. |
 
@@ -291,7 +301,21 @@ With `teamsMsgUrl` set, each alert is posted as JSON:
 {"location": "<room name>", "device": "<codec model>", "message": "OPC4 heartbeat missing. ...", "company": "...", "site": "..."}
 ```
 
-On the panel, State switches to `HEARTBEAT MISSING` and back to `OK`. See `INTEGRATION.md` for other ways to use the data.
+On the panel, State switches to `OFFLINE` and back to `ONLINE` (see [State values](#state-values)). See `INTEGRATION.md` for other ways to use the data.
+
+### Reliability
+
+The macro is built to run unattended for months:
+
+| Situation | Behaviour |
+| --- | --- |
+| Webhook slow or unreachable | Alerts are queued and sent one at a time in the background (10 s timeout each). Heartbeat handling and the panel never wait for them. |
+| Codec slow to answer an xAPI call | Every call times out after 8 s; polls and watchdog checks never pile up or hang. |
+| Several updates at once | Panel writes run one at a time with the newest values, so an older write can never land after a newer one. |
+| Panel overwritten or (re)imported | The panel is rewritten at least once a minute. |
+| An xAPI call fails | Logged and retried on the next cycle; nothing stops. |
+
+**Known limit of the widget transport:** the OPC4 and the macro share one widget. If the OPC4 writes within a few milliseconds of the macro writing its `read:` mark (about once per heartbeat), that OPC4 update is lost. A lost heartbeat is harmless. A lost port change stays on the panel until the next status change, or until the next heartbeat if the OPC4 sends the full status every time. The **Message transport** has no such limit.
 
 ---
 
@@ -305,9 +329,9 @@ On the panel, State switches to `HEARTBEAT MISSING` and back to `OK`. See `INTEG
 | `ok, 1 update overwritten between polls (78)` | Widget transport: two updates within one poll; the earlier one was replaced. Harmless. |
 | `1 update not received (78)` | Message transport: an update really did not arrive |
 | `jumped from 82 to 200 (OPC4 restarted or counter reset?)` | Large sequence jump, usually an OPC4 restart |
-| `duplicate` | Same sequence number twice |
-| `status unknown (waiting for the first status change from the OPC4)` | No status known yet, see [section 8](#8-status-after-a-restart) |
-| `Restored last known status from <time>` | Status loaded from the saved copy at start |
+| `duplicate` | Same sequence number as the previous payload. Still counted as a heartbeat (the OPC4 is alive); usually means the OPC4 repeats its last value instead of incrementing `alive`. |
+| `no port / mode status reported yet` | Only heartbeats received so far, see [section 8](#8-status-after-a-restart) |
+| `Removed 'opc4_heartbeat_state' left by an earlier version.` | One-off clean-up of the helper macro older versions used |
 | `Sending status to display widgets: ...` | Which visible widgets were found and are being updated |
 | `Status panel 'OPC4 Status' installed in the Control Panel.` | Macro created / updated its panel |
 | `Display widgets already exist on another panel; no status panel created.` | `showStatusPanel: true`, but your own panel has the widgets; it is used instead |
@@ -316,24 +340,21 @@ On the panel, State switches to `HEARTBEAT MISSING` and back to `OK`. See `INTEG
 
 ## 8. Status after a restart
 
-Heartbeats only contain `alive=N`, so after a macro restart or codec reboot the macro would not know ports and mode until the OPC4 reports a change. The macro therefore saves the last known status in an **inactive** macro named `opc4_heartbeat_state` and restores it on start.
+Heartbeats only contain `alive=N`; ports and mode are sent only when they change. After a macro restart or codec reboot the macro therefore starts from the defaults (Active Port, Connected Ports, Mode and State `N/A`, Updated At `Waiting for update`):
 
-- You will see `opc4_heartbeat_state` in the Macro Editor. Leave it switched off and do not delete it.
-- With no saved status yet (first install), the panel shows `unknown` until the first status change.
-- The restored status is the *last known* one. If ports changed while the codec was down, it is corrected at the next status change.
-- Best long-term fix on the OPC4 side: send the full status in every heartbeat (`alive=N,connected=..,active=..,mode=..`).
+- **State** and **Updated At** update with the first heartbeat (within about 30 s).
+- **Active Port**, **Connected Ports** and **Mode** update with the next status change from the OPC4. If the last value the OPC4 wrote to `opc_status` contained the status, it is used straight away.
+- Nothing is restored from earlier sessions. An older version did that and could keep showing e.g. ports `1, 4` while nothing was connected; its helper macro `opc4_heartbeat_state` is removed automatically on start.
+- Best long-term fix on the OPC4 side: send the full status in every heartbeat (`alive=N,connected=..,active=..,mode=..`). The panel is then complete within 30 s of any restart.
 
 ---
 
 ## 9. Removing everything
 
-```powershell
-.\deploy-macro.ps1 -CiscoHost 192.168.6.1 -Username admin -Password '...' -UseHttp -Remove
-```
+1. Macro Editor: delete the monitor macro (e.g. `opc4_heartbeat_monitor_v2`).
+2. UI Extensions editor: delete the panels the macro created, **OPC4 Status** (`opc4_hb_v2_status`) and **OPC4 Heartbeat Source** (`opc4_hb_v2_source`), then upload.
 
-Removes the macro `opc4_heartbeat_monitor_v2`, the saved status `opc4_heartbeat_state`, and the panels the macro created (`opc4_hb_v2_status`, `opc4_hb_v2_source`). Panels you created yourself and other macros are not touched.
-
-By hand: delete those two macros in the Macro Editor and those two panels in the UI Extensions editor.
+Panels you created yourself and other macros are not affected.
 
 ---
 

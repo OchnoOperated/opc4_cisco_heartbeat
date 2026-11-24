@@ -104,8 +104,8 @@ const state = {
   lastAliveSequence: null,
   peripheralConnected: null,
   displayTargets: [], // display widget IDs the macro writes to (existing or installed)
-  // null = not known yet. Heartbeats carry only alive=N, so the status is only
-  // known after a status change, the widget baseline, or the saved last-known status.
+  // null = not reported yet. Heartbeats carry only alive=N, so the status is
+  // only known after a status change or from the widget baseline.
   status: { connected: null, active: null, mode: null },
 };
 
@@ -115,6 +115,18 @@ const state = {
 function log(message) {
   if (CONFIG.debug) console.log(message);
 }
+
+// xAPI calls normally answer in milliseconds. If one never answers (codec busy,
+// runtime hiccup), give up after `ms` so polling and the watchdog never hang.
+function withTimeout(promise, ms, what) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms} ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+const XAPI_TIMEOUT_MS = 8000;
+const DISPLAY_REFRESH_MS = 60000; // rewrite the panel at least this often
 
 function toArray(value) {
   if (Array.isArray(value)) return value;
@@ -181,33 +193,46 @@ function describeSequence(seq, source) {
     : `${missed} update${plural} not received (${ids})`;
 }
 
+// Text shown on the panel while a value has not been reported by the OPC4.
+// "None" is reserved for a reported 0 (no port active / nothing connected).
+const DEFAULT_TEXT = {
+  active: 'N/A',
+  connected: 'N/A',
+  mode: 'N/A',
+  state: 'N/A',
+  updatedAt: 'Waiting for update',
+};
+
+// Not reported yet (null) shows N/A; a reported 0 ("nothing connected") shows None.
 function decodeConnectedPorts(bitmap) {
-  if (bitmap === null || bitmap === undefined) return 'unknown';
+  if (bitmap === null || bitmap === undefined) return DEFAULT_TEXT.connected;
   const value = Number.parseInt(bitmap, 10);
-  if (Number.isNaN(value) || value <= 0) return 'none';
+  if (Number.isNaN(value) || value <= 0) return 'None';
   const ports = [];
   for (let port = 1; port <= 4; port += 1) {
     if (value & (1 << (port - 1))) ports.push(port);
   }
-  return ports.length ? ports.join(', ') : 'none';
+  return ports.length ? ports.join(', ') : 'None';
 }
 
 function summary() {
   const s = state.status;
   if (s.connected === null && s.active === null && s.mode === null) {
-    return 'status unknown (waiting for the first status change from the OPC4)';
+    return 'no port / mode status reported yet';
   }
-  const v = (x) => (x === null ? 'unknown' : x);
+  const v = (x) => (x === null ? 'not reported' : x);
   return `connected=${v(s.connected)} (ports ${decodeConnectedPorts(s.connected)}), `
     + `active=${v(s.active)}, mode=${v(s.mode)}`;
 }
 
 // ---------------------------------------------------------------------------
-// Last-known status, kept across macro restarts and codec reboots
+// Status handling
 // ---------------------------------------------------------------------------
-// Stored as an inactive macro, the usual way to persist data on RoomOS.
-const STORE_MACRO = 'opc4_heartbeat_state';
+// The status is never restored from earlier sessions: a stale saved value
+// (e.g. "ports 1, 4") would stay on the panel while nothing is connected,
+// because the OPC4 only reports changes. The panel starts at the defaults.
 const STATUS_KEYS = ['connected', 'active', 'mode'];
+const OLD_STORE_MACRO = 'opc4_heartbeat_state'; // used by earlier versions
 
 // Apply status fields from a payload. Returns true if anything changed.
 function applyStatus(parsed) {
@@ -218,42 +243,28 @@ function applyStatus(parsed) {
       changed = true;
     }
   });
-  if (changed) saveStatus();
   return changed;
 }
 
-async function saveStatus() {
-  const body = `// Written by the OPC4 heartbeat monitor. Do not activate or edit.\n`
-    + `const saved = ${JSON.stringify({ status: state.status, savedAt: timeStamp() })};\n`;
+// Earlier versions kept the status in an inactive helper macro; remove it.
+async function removeOldStatusStore() {
   try {
-    await xapi.Command.Macros.Macro.Save({ Name: STORE_MACRO, Overwrite: 'True' }, body);
+    await xapi.Command.Macros.Macro.Remove({ Name: OLD_STORE_MACRO });
+    log(`Removed '${OLD_STORE_MACRO}' left by an earlier version.`);
   } catch (error) {
-    log(`Unable to save last known status: ${error.message || error}`);
-  }
-}
-
-async function loadSavedStatus() {
-  try {
-    const result = await xapi.Command.Macros.Macro.Get({ Name: STORE_MACRO, Content: 'True' });
-    const macro = toArray(result && result.Macro)[0];
-    const content = (macro && macro.Content) || '';
-    const match = content.match(/const saved = (\{.*\});/);
-    if (!match) return;
-    const saved = JSON.parse(match[1]);
-    STATUS_KEYS.forEach((k) => {
-      if (saved.status && saved.status[k] !== undefined) state.status[k] = saved.status[k];
-    });
-    console.log(`Restored last known status from ${saved.savedAt}: ${summary()}. `
-      + 'It is replaced as soon as the OPC4 reports a status change.');
-  } catch (error) {
-    log('No saved status yet; status unknown until the OPC4 reports a change.');
+    // Not there: nothing to clean up.
   }
 }
 
 // ---------------------------------------------------------------------------
 // Alerts
 // ---------------------------------------------------------------------------
-async function sendAlert(message) {
+// Alerts are queued and sent one at a time (RoomOS HttpClient cannot run two
+// requests at once) and never awaited by the caller, so a slow or unreachable
+// webhook can never delay heartbeat handling or the panel.
+let alertQueue = Promise.resolve();
+
+function sendAlert(message) {
   const payload = {
     location: state.location,
     device: state.device,
@@ -268,14 +279,12 @@ async function sendAlert(message) {
     return;
   }
 
-  try {
-    await xapi.Command.HttpClient.Post(
-      { Header: 'Content-Type: application/json', Url: CONFIG.teamsMsgUrl },
+  alertQueue = alertQueue
+    .then(() => withTimeout(xapi.Command.HttpClient.Post(
+      { Header: 'Content-Type: application/json', Url: CONFIG.teamsMsgUrl, Timeout: 10 },
       JSON.stringify(payload),
-    );
-  } catch (error) {
-    console.error('Failed to post alert', error);
-  }
+    ), 15000, 'Alert post'))
+    .catch((error) => console.error('Failed to post alert', error.message || error));
 }
 
 // ---------------------------------------------------------------------------
@@ -297,12 +306,13 @@ function panelXml(panelId, name, location, rows, icon = 'Info') {
 
 // Layout of the panel the macro builds (showStatusPanel = true). Edit here,
 // not in the UI Extensions editor: the macro re-saves its panel on every start.
+// [row name, widget ID, width 1-4, text alignment left|center|right]
 const STATUS_PANEL_ROWS = [
-  ['Active Port', DISPLAY_WIDGETS.active, 2],
-  ['Connected Ports', DISPLAY_WIDGETS.connected, 2],
-  ['Mode', DISPLAY_WIDGETS.mode, 2],
-  ['State', DISPLAY_WIDGETS.state, 2],
-  ['Last Heartbeat', DISPLAY_WIDGETS.heartbeat, 4],
+  ['Active Port', DISPLAY_WIDGETS.active, 2, 'center'],
+  ['Connected Ports', DISPLAY_WIDGETS.connected, 2, 'center'],
+  ['Mode', DISPLAY_WIDGETS.mode, 2, 'center'],
+  ['State', DISPLAY_WIDGETS.state, 2, 'center'],
+  ['Updated At', DISPLAY_WIDGETS.heartbeat, 4, 'right'],
 ];
 
 async function panelExists(panelId) {
@@ -339,7 +349,8 @@ async function installPanels() {
 }
 
 async function existingWidgetIds() {
-  const widgets = toArray(await xapi.Status.UserInterface.Extensions.Widget.get());
+  const widgets = toArray(await withTimeout(
+    xapi.Status.UserInterface.Extensions.Widget.get(), XAPI_TIMEOUT_MS, 'Widget list'));
   return new Set(widgets.map((w) => w.WidgetId));
 }
 
@@ -381,7 +392,7 @@ async function installDisplayPanel() {
       await xapi.Command.UserInterface.Extensions.Panel.Save(
         { PanelId: DISPLAY_PANEL_ID },
         panelXml(DISPLAY_PANEL_ID, CONFIG.statusPanelName, 'ControlPanel',
-          STATUS_PANEL_ROWS.map(([name, id, size]) => textRow(name, id, size, 'center')),
+          STATUS_PANEL_ROWS.map(([name, id, size, align]) => textRow(name, id, size, align)),
           CONFIG.statusPanelIcon),
       );
       log(`Status panel '${CONFIG.statusPanelName}' installed in the Control Panel.`);
@@ -394,23 +405,50 @@ async function installDisplayPanel() {
 
 async function setWidget(widgetId, value) {
   try {
-    await xapi.Command.UserInterface.Extensions.Widget.SetValue({ WidgetId: widgetId, Value: String(value) });
+    await withTimeout(xapi.Command.UserInterface.Extensions.Widget.SetValue(
+      { WidgetId: widgetId, Value: String(value) }), XAPI_TIMEOUT_MS, `SetValue ${widgetId}`);
   } catch (error) {
     log(`Unable to update widget ${widgetId}: ${error.message || error}`);
   }
 }
 
+// Panel writes run one at a time. A request that arrives while a write is in
+// progress is merged into one more pass with the newest state, so an older
+// write can never land after a newer one and leave stale values on the panel.
+let displayBusy = false;
+let displayDirty = false;
+
 async function updateDisplay() {
+  if (displayBusy) {
+    displayDirty = true;
+    return;
+  }
+  displayBusy = true;
+  try {
+    do {
+      displayDirty = false;
+      await writeDisplay();
+    } while (displayDirty);
+  } finally {
+    displayBusy = false;
+  }
+}
+
+async function writeDisplay() {
+  state.lastDisplayAtMs = Date.now();
   await refreshDisplayTargets();
   if (!state.displayTargets.length) return;
   const s = state.status;
+  let stateText = DEFAULT_TEXT.state; // no heartbeat yet
+  if (state.heartbeatMissing) stateText = 'OFFLINE'; // no heartbeat within the timeout
+  else if (state.lastHeartbeatAtMs) stateText = 'ONLINE';
   const values = {
-    [DISPLAY_WIDGETS.state]: state.heartbeatMissing ? 'HEARTBEAT MISSING' : 'OK',
-    [DISPLAY_WIDGETS.heartbeat]:
-      state.lastHeartbeatAtMs ? timeStamp(new Date(state.lastHeartbeatAtMs)) : 'never',
-    [DISPLAY_WIDGETS.mode]: s.mode === null ? 'unknown' : String(s.mode).toUpperCase(), // UC / BYOD
+    [DISPLAY_WIDGETS.state]: stateText,
+    [DISPLAY_WIDGETS.heartbeat]: state.lastHeartbeatAtMs
+      ? timeStamp(new Date(state.lastHeartbeatAtMs)) : DEFAULT_TEXT.updatedAt,
+    [DISPLAY_WIDGETS.mode]: s.mode === null ? DEFAULT_TEXT.mode : String(s.mode).toUpperCase(), // UC / BYOD
     [DISPLAY_WIDGETS.connected]: decodeConnectedPorts(s.connected),
-    [DISPLAY_WIDGETS.active]: s.active === null ? 'unknown' : (s.active === '0' ? 'none' : s.active),
+    [DISPLAY_WIDGETS.active]: s.active === null ? DEFAULT_TEXT.active : (s.active === '0' ? 'None' : s.active),
   };
   // Only write widgets that exist, so an older panel without e.g. opc_state
   // does not produce an error log on every heartbeat.
@@ -424,8 +462,9 @@ async function onPayload(rawText, source) {
   const parsed = parseStatusPayload(rawText);
   const seq = parseAliveSequence(parsed);
   const seqState = describeSequence(seq, source);
-  const isStatusChange = STATUS_KEYS.some((k) => k in parsed);
-  applyStatus(parsed);
+  // "Status change" only when a port / mode value actually changed; a payload
+  // that repeats the current status is logged as a heartbeat.
+  const isStatusChange = applyStatus(parsed);
 
   state.lastHeartbeatAtMs = Date.now();
   state.lastSource = source;
@@ -437,7 +476,7 @@ async function onPayload(rawText, source) {
 
   if (state.heartbeatMissing) {
     state.heartbeatMissing = false;
-    await sendAlert(`OPC4 heartbeat recovered (via ${source}). Current status: ${summary()}.`);
+    sendAlert(`OPC4 heartbeat recovered (via ${source}). Current status: ${summary()}.`);
   }
 
   await updateDisplay();
@@ -468,32 +507,75 @@ function startMessageTransport() {
 }
 
 // --- Transport 2: Widget ------------------------------------------------------
+// A widget only holds text, and polling cannot see the OPC4 writing the SAME
+// text again (e.g. an identical heartbeat every 30 s). So the macro marks a
+// value it has read by prefixing it ("read:alive=5,..."); the next OPC4 write,
+// identical or not, replaces the mark and is detected.
+//
+// The mark is written only once the widget has been quiet for MARK_DELAY_MS.
+// The macro and the OPC4 write the same widget, so writing the mark right
+// after a read could overwrite an OPC4 update that arrives a few ms later
+// (e.g. a port change right after a heartbeat). During such bursts the macro
+// never writes; in the quiet time before the next heartbeat it does.
+const READ_PREFIX = 'read:';
+const MARK_DELAY_MS = Math.min(3000, (CONFIG.heartbeatIntervalSeconds * 1000) / 4);
+
+function scheduleMark(text) {
+  state.markText = text;
+  state.markDueAtMs = Date.now() + MARK_DELAY_MS;
+}
+
+async function markWidgetRead(text) {
+  const marked = READ_PREFIX + text;
+  state.lastWidgetValue = marked;
+  state.markText = null;
+  await setWidget(CONFIG.statusWidgetId, marked);
+}
+
 async function handleWidgetValue(value) {
   const text = String(value || '');
+  const alreadyRead = text.startsWith(READ_PREFIX);
+
   // The first read after a macro (re)start is a baseline, possibly a stale
-  // value from before the restart; remember it but do not count it as a heartbeat.
+  // value from before the restart: use its status, but do not count it as a heartbeat.
   if (state.lastWidgetValue === null) {
     state.lastWidgetValue = text;
     log(`Widget '${CONFIG.statusWidgetId}' baseline value '${text}' (not counted as heartbeat).`);
-    // A baseline with status fields is newer than the saved status, so it wins.
-    if (applyStatus(parseStatusPayload(text))) {
+    if (applyStatus(parseStatusPayload(alreadyRead ? text.slice(READ_PREFIX.length) : text))) {
       log(`Status taken from widget baseline: ${summary()}.`);
       await updateDisplay();
     }
+    if (text && !alreadyRead) scheduleMark(text);
     return;
   }
-  if (!text || text === state.lastWidgetValue) return;
+
+  // Unchanged since the last read: mark it as read once it has been quiet long enough.
+  if (text && text === state.lastWidgetValue) {
+    if (state.markText === text && Date.now() >= state.markDueAtMs) await markWidgetRead(text);
+    return;
+  }
+
+  // Empty or our own "read:" mark: nothing new.
+  if (!text || alreadyRead) return;
+
   state.lastWidgetValue = text;
+  scheduleMark(text);
   await onPayload(text, 'widget');
 }
 
 async function readWidgetValue() {
-  const widgets = toArray(await xapi.Status.UserInterface.Extensions.Widget.get());
+  const widgets = toArray(await withTimeout(
+    xapi.Status.UserInterface.Extensions.Widget.get(), XAPI_TIMEOUT_MS, 'Widget read'));
   const match = widgets.find((w) => w.WidgetId === CONFIG.statusWidgetId);
   return match ? String(match.Value || '') : null;
 }
 
+// One poll at a time: if the codec is slow, polls are skipped instead of piling up.
+let pollBusy = false;
+
 async function pollWidget() {
+  if (pollBusy) return;
+  pollBusy = true;
   try {
     const value = await readWidgetValue();
     if (value === null) {
@@ -506,7 +588,9 @@ async function pollWidget() {
     }
     await handleWidgetValue(value);
   } catch (error) {
-    console.error('Widget poll failed', error);
+    console.error('Widget poll failed', error.message || error);
+  } finally {
+    pollBusy = false;
   }
 }
 
@@ -532,16 +616,17 @@ function startWidgetTransport() {
 async function checkPeripheral() {
   if (!CONFIG.peripheralId) return;
   try {
-    const devices = toArray(await xapi.Status.Peripherals.ConnectedDevice.get());
+    const devices = toArray(await withTimeout(
+      xapi.Status.Peripherals.ConnectedDevice.get(), XAPI_TIMEOUT_MS, 'Peripheral read'));
     const match = devices.find((d) => d.ID === CONFIG.peripheralId);
     const connected = Boolean(match && match.Status === 'Connected');
 
     if (state.peripheralConnected === null) {
       log(`Peripheral '${CONFIG.peripheralId}' initial state: ${match ? match.Status : 'not registered'}.`);
     } else if (connected && !state.peripheralConnected) {
-      await sendAlert(`OPC4 peripheral '${CONFIG.peripheralId}' is connected again.`);
+      sendAlert(`OPC4 peripheral '${CONFIG.peripheralId}' is connected again.`);
     } else if (!connected && state.peripheralConnected) {
-      await sendAlert(`OPC4 peripheral '${CONFIG.peripheralId}' lost connection `
+      sendAlert(`OPC4 peripheral '${CONFIG.peripheralId}' lost connection `
         + `(status: ${match ? match.Status : 'removed'}).`);
     }
     state.peripheralConnected = connected;
@@ -562,20 +647,32 @@ function startPeripheralTransport() {
 // ---------------------------------------------------------------------------
 // Watchdog
 // ---------------------------------------------------------------------------
+let watchdogBusy = false;
+
 async function watchdog() {
-  if (CONFIG.transports.peripheral) await checkPeripheral();
+  if (watchdogBusy) return;
+  watchdogBusy = true;
+  try {
+    if (CONFIG.transports.peripheral) await checkPeripheral();
 
-  const reference = state.lastHeartbeatAtMs || state.startedAtMs;
-  const ageMs = Date.now() - reference;
-  if (ageMs <= heartbeatTimeoutMs() || state.heartbeatMissing) return;
-
-  state.heartbeatMissing = true;
-  const ageSeconds = Math.floor(ageMs / 1000);
-  const what = state.lastHeartbeatAtMs
-    ? `No heartbeat for ${ageSeconds} s (last via ${state.lastSource}).`
-    : `No heartbeat received since macro start ${ageSeconds} s ago.`;
-  await sendAlert(`OPC4 heartbeat missing. ${what} Last known status: ${summary()}.`);
-  await updateDisplay();
+    const reference = state.lastHeartbeatAtMs || state.startedAtMs;
+    const ageMs = Date.now() - reference;
+    if (ageMs > heartbeatTimeoutMs() && !state.heartbeatMissing) {
+      state.heartbeatMissing = true;
+      const ageSeconds = Math.floor(ageMs / 1000);
+      const what = state.lastHeartbeatAtMs
+        ? `No heartbeat for ${ageSeconds} s (last via ${state.lastSource}).`
+        : `No heartbeat received since macro start ${ageSeconds} s ago.`;
+      sendAlert(`OPC4 heartbeat missing. ${what} Last known status: ${summary()}.`);
+      await updateDisplay();
+    } else if (Date.now() - (state.lastDisplayAtMs || 0) > DISPLAY_REFRESH_MS) {
+      // Periodic rewrite: repairs the panel if anything else overwrote it, and
+      // covers a panel that was (re)imported while the OPC4 sends nothing new.
+      await updateDisplay();
+    }
+  } finally {
+    watchdogBusy = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -595,7 +692,7 @@ async function start() {
   }
 
   await loadDeviceInfo();
-  await loadSavedStatus();
+  await removeOldStatusStore();
   await installPanels();
 
   if (CONFIG.transports.message) startMessageTransport();
@@ -603,8 +700,9 @@ async function start() {
   if (CONFIG.transports.peripheral) startPeripheralTransport();
 
   await updateDisplay();
-  setInterval(() => watchdog().catch((e) => console.error('Watchdog failed', e)), CONFIG.watchdogSeconds * 1000);
+  setInterval(() => watchdog().catch((e) => console.error('Watchdog failed', e.message || e)),
+    CONFIG.watchdogSeconds * 1000);
   log(`Heartbeat timeout: ${heartbeatTimeoutMs() / 1000} s.`);
 }
 
-start();
+start().catch((error) => console.error('Start-up failed', error.message || error));

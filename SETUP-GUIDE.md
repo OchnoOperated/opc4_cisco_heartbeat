@@ -39,8 +39,9 @@ This macro lets your Cisco video system check that the Ochno OPC4 is alive. It r
 ## Good to know
 
 - Only one copy of the macro should be enabled.
-- A macro named `opc4_heartbeat_state` appears automatically. It stores the last known status. Leave it switched off and do not delete it.
+- Right after the macro starts, the panel shows `N/A` and `Waiting for update` until the OPC4 reports its status. `None` means the OPC4 reported that nothing is connected / no port is active.
+- **State** on the panel: `ONLINE` = the OPC4 is responding. `OFFLINE` = no heartbeat from the OPC4 for over a minute: check its power, network and login details. `N/A` = nothing received yet since the macro started.
 - Changes to the panel layout are made in the macro, not in the UI Extensions editor.
-- To remove: delete both macros in the Macro Editor and the **OPC4 Status** / **OPC4 Heartbeat Source** panels in the UI Extensions editor.
+- To remove: delete the macro in the Macro Editor and the **OPC4 Status** / **OPC4 Heartbeat Source** panels in the UI Extensions editor.
 
 For details and troubleshooting, see `README.md`, or contact Ochno support.
